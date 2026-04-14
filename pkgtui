@@ -326,7 +326,10 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
                 try:
                     data = os.read(master_fd, 4096)
                     if data:
-                        log.write(strip_ansi(data.decode("utf-8", errors="replace")))
+                        text = strip_ansi(data.decode("utf-8", errors="replace"))
+                        # Ensure password prompts start on their own line
+                        text = re.sub(r"(?<!\n)(\[sudo\]|Password:)", r"\n\1", text)
+                        log.write(text)
                 except OSError:
                     running = False
 
