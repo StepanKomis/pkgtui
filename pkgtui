@@ -609,20 +609,25 @@ def draw_menu(stdscr, sel):
     safe_add(stdscr, menu_y + len(MENU_ITEMS) * 2, menu_x,
              "╚" + "═" * (menu_w - 2) + "╝", ba)
 
-    desc_row = menu_y + len(MENU_ITEMS) * 2 + 2
+    desc_row = menu_y + len(MENU_ITEMS) * 2 + 1
     _, desc = MENU_ITEMS[sel]
     box_w = min(menu_w, len(desc) + 8)
     box_x = (cols - box_w) // 2
-    safe_add(stdscr, desc_row,     box_x,
-             "╭" + "─" * (box_w - 2) + "╮", curses.color_pair(C_DIM))
-    content = f"  ▸ {desc}  "
-    safe_add(stdscr, desc_row + 1, box_x, "│", curses.color_pair(C_DIM))
-    safe_add(stdscr, desc_row + 1, box_x + 1,
-             content[:box_w - 2].ljust(box_w - 2),
-             curses.color_pair(C_HILITE) | curses.A_BOLD)
-    safe_add(stdscr, desc_row + 1, box_x + box_w - 1, "│", curses.color_pair(C_DIM))
-    safe_add(stdscr, desc_row + 2, box_x,
-             "╰" + "─" * (box_w - 2) + "╯", curses.color_pair(C_DIM))
+    hint_row = rows - 2
+    # Only draw full 3-row box if there's room; otherwise fall back to one line
+    if desc_row + 2 < hint_row:
+        safe_add(stdscr, desc_row,     box_x,
+                 "╭" + "─" * (box_w - 2) + "╮", curses.color_pair(C_DIM))
+        safe_add(stdscr, desc_row + 1, box_x, "│", curses.color_pair(C_DIM))
+        safe_add(stdscr, desc_row + 1, box_x + 1,
+                 f"  ▸ {desc}  "[:box_w - 2].ljust(box_w - 2),
+                 curses.color_pair(C_HILITE) | curses.A_BOLD)
+        safe_add(stdscr, desc_row + 1, box_x + box_w - 1, "│", curses.color_pair(C_DIM))
+        safe_add(stdscr, desc_row + 2, box_x,
+                 "╰" + "─" * (box_w - 2) + "╯", curses.color_pair(C_DIM))
+    elif desc_row < hint_row:
+        safe_add(stdscr, desc_row, (cols - len(desc) - 6) // 2,
+                 f"  ▸  {desc}", curses.color_pair(C_HILITE))
 
     hint = "  [↑↓] Navigate    [Enter/Space] Select    [q/Esc] Quit  "
     safe_add(stdscr, rows - 2, (cols - len(hint)) // 2,
