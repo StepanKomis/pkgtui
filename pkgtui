@@ -611,9 +611,18 @@ def draw_menu(stdscr, sel):
 
     desc_row = menu_y + len(MENU_ITEMS) * 2 + 2
     _, desc = MENU_ITEMS[sel]
-    desc_line = f"  ▸  {desc}"
-    safe_add(stdscr, desc_row, (cols - len(desc_line)) // 2,
-             desc_line, curses.color_pair(C_HILITE))
+    box_w = min(menu_w, len(desc) + 8)
+    box_x = (cols - box_w) // 2
+    safe_add(stdscr, desc_row,     box_x,
+             "╭" + "─" * (box_w - 2) + "╮", curses.color_pair(C_DIM))
+    content = f"  ▸ {desc}  "
+    safe_add(stdscr, desc_row + 1, box_x, "│", curses.color_pair(C_DIM))
+    safe_add(stdscr, desc_row + 1, box_x + 1,
+             content[:box_w - 2].ljust(box_w - 2),
+             curses.color_pair(C_HILITE) | curses.A_BOLD)
+    safe_add(stdscr, desc_row + 1, box_x + box_w - 1, "│", curses.color_pair(C_DIM))
+    safe_add(stdscr, desc_row + 2, box_x,
+             "╰" + "─" * (box_w - 2) + "╯", curses.color_pair(C_DIM))
 
     hint = "  [↑↓] Navigate    [Enter/Space] Select    [q/Esc] Quit  "
     safe_add(stdscr, rows - 2, (cols - len(hint)) // 2,
