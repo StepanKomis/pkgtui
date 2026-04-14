@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 MIN_ROWS, MIN_COLS = 24, 80
 
 # ─── Color pairs ──────────────────────────────────────────────────────────────
