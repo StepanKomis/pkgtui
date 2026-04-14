@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""
+pkgtui — Arch Linux Package Manager TUI
+Vibecoded with Claude. See README.md.
+"""
+
+import curses
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# ─── Version ──────────────────────────────────────────────────────────────────
+
+VERSION = "1.0.0"
+MIN_ROWS, MIN_COLS = 24, 80
+
+# ─── Color pair IDs ───────────────────────────────────────────────────────────
+
+C_BORDER = 1   # cyan   — borders, logo
+C_HILITE = 2   # yellow — key hints, labels
+C_NORMAL = 3   # white  — general text
+C_OK     = 4   # green  — success messages
+C_ERROR  = 5   # red    — error messages
+C_DIM    = 6   # blue   — secondary text
+C_SEL    = 7   # black on cyan — selected item
+
+# ─── Menu ─────────────────────────────────────────────────────────────────────
+
+MENU_ITEMS = [
+    ("[1] System Update",    "Upgrade all packages via pacman + yay (AUR)"),
+    ("[2] Search & Install", "Fuzzy-search repos and AUR, then install"),
+    ("[3] Remove Package",   "Select from installed packages to uninstall"),
+    ("[4] Exit",             "Quit pkgtui"),
+]
+
+LOGO = [
+    " ██████╗ ██╗  ██╗ ██████╗ ████████╗██╗   ██╗██╗",
+    " ██╔══██╗██║ ██╔╝██╔════╝ ╚══██╔══╝██║   ██║██║",
+    " ██████╔╝█████╔╝ ██║  ███╗   ██║   ██║   ██║██║",
+    " ██╔═══╝ ██╔═██╗ ██║   ██║   ██║   ██║   ██║██║",
+    " ██║     ██║  ██╗╚██████╔╝   ██║   ╚██████╔╝██║",
+    " ╚═╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═╝",
+]
+LOGO_W = max(len(l) for l in LOGO)
+
+# fzf colors that match the curses cyan theme
+FZF_COLORS = (
+    "bg:#0d0d1a,fg:#c0c0c0,hl:#00ffff,"
+    "fg+:#ffffff,bg+:#1a1a3e,hl+:#ffff00,"
+    "border:#0088aa,header:#00bbcc,info:#666688,"
+    "prompt:#00ccdd,pointer:#ffdd00,marker:#ff8800"
+)
+
+# ─── Curses helpers ───────────────────────────────────────────────────────────
+
+def init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(C_BORDER, curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_HILITE, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_NORMAL, curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_OK,     curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_ERROR,  curses.COLOR_RED,     -1)
+    curses.init_pair(C_DIM,    curses.COLOR_BLUE,    -1)
+    curses.init_pair(C_SEL,    curses.COLOR_BLACK,   curses.COLOR_CYAN)
+
+
+def safe_add(win, y, x, text, attr=0):
+    """Write text, clipping to window bounds without raising."""
+    rows, cols = win.getmaxyx()
+    if y < 0 or y >= rows or x < 0 or x >= cols:
+        return
+    avail = cols - x - (1 if y == rows - 1 else 0)
+    if avail <= 0:
+        return
+    try:
+        win.addstr(y, x, text[:avail], attr)
+    except curses.error:
+        pass
+
+
+def draw_box(win, y, x, h, w, attr, title=""):
+    """Draw a double-line box. Optionally embed title in top border."""
+    inner = w - 2
+    top = "╔" + "═" * inner + "╗"
+    if title:
+        ins = f" {title} "
+        if len(ins) < inner:
+            pos = (inner - len(ins)) // 2
+            top = "╔" + "═" * pos + ins + "═" * (inner - pos - len(ins)) + "╗"
+    safe_add(win, y, x, top, attr)
+    for r in range(1, h - 1):
+        safe_add(win, y + r, x,         "║", attr)
+        safe_add(win, y + r, x + w - 1, "║", attr)
+    safe_add(win, y + h - 1, x, "╚" + "═" * inner + "╝", attr)
+
+
+def restore_curses(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.clear()
+    stdscr.refresh()
+
+# ─── Main menu drawing ────────────────────────────────────────────────────────
+
+def draw_menu(stdscr, sel):
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+
+    border_attr = curses.color_pair(C_BORDER) | curses.A_BOLD
+
+    # Terminal too small?
+    if rows < MIN_ROWS or cols < MIN_COLS:
+        msg = f"Terminal too small ({cols}x{rows}). Need {MIN_COLS}x{MIN_ROWS}."
+        safe_add(stdscr, rows // 2, max(0, (cols - len(msg)) // 2),
+                 msg, curses.color_pair(C_ERROR) | curses.A_BOLD)
+        stdscr.refresh()
+        return
+
+    # Outer box
+    draw_box(stdscr, 0, 0, rows, cols, border_attr, f" pkgtui v{VERSION} ")
+
+    # Logo (centered)
+    logo_start_row = 1
+    logo_col = max(1, (cols - LOGO_W) // 2)
+    for i, line in enumerate(LOGO):
+        safe_add(stdscr, logo_start_row + i, logo_col, line,
+                 curses.color_pair(C_BORDER) | curses.A_BOLD)
+
+    # Subtitle
+    sub = "Arch Linux Package Manager  •  CachyOS Edition"
+    safe_add(stdscr, logo_start_row + len(LOGO), (cols - len(sub)) // 2,
+             sub, curses.color_pair(C_DIM))
+
+    # Separator
+    sep_row = logo_start_row + len(LOGO) + 1
+    safe_add(stdscr, sep_row, 0, "╠" + "═" * (cols - 2) + "╣", border_attr)
+
+    # Menu box
+    menu_h = len(MENU_ITEMS) * 2 + 1
+    menu_w = min(cols - 8, 52)
+    menu_y = sep_row + 2
+    menu_x = (cols - menu_w) // 2
+
+    # Draw menu items with separators
+    for i, (label, _) in enumerate(MENU_ITEMS):
+        row = menu_y + i * 2
+        # Top border of item cell
+        if i == 0:
+            safe_add(stdscr, row, menu_x,
+                     "╔" + "═" * (menu_w - 2) + "╗", border_attr)
+        else:
+            safe_add(stdscr, row, menu_x,
+                     "╠" + "═" * (menu_w - 2) + "╣", border_attr)
+
+        # Item row
+        item_row = row + 1
+        safe_add(stdscr, item_row, menu_x, "║", border_attr)
+        safe_add(stdscr, item_row, menu_x + menu_w - 1, "║", border_attr)
+
+        arrow = "▶ " if i == sel else "  "
+        item_text = f" {arrow}{label}"
+        padded = item_text.ljust(menu_w - 2)
+
+        if i == sel:
+            safe_add(stdscr, item_row, menu_x + 1, padded,
+                     curses.color_pair(C_SEL) | curses.A_BOLD)
+        else:
+            safe_add(stdscr, item_row, menu_x + 1, padded,
+                     curses.color_pair(C_NORMAL))
+
+    # Bottom border
+    safe_add(stdscr, menu_y + len(MENU_ITEMS) * 2, menu_x,
+             "╚" + "═" * (menu_w - 2) + "╝", border_attr)
+
+    # Description of selected item
+    desc_row = menu_y + menu_h + 1
+    _, desc = MENU_ITEMS[sel]
+    desc_line = f"  ▸  {desc}"
+    safe_add(stdscr, desc_row, (cols - len(desc_line)) // 2,
+             desc_line, curses.color_pair(C_HILITE))
+
+    # Key hint bar
+    hint = "  [↑↓] Navigate    [Enter/Space] Select    [q/Esc] Quit  "
+    safe_add(stdscr, rows - 2, (cols - len(hint)) // 2,
+             hint, curses.color_pair(C_DIM))
+
+    stdscr.refresh()
+
+# ─── In-TUI search query dialog ───────────────────────────────────────────────
+
+def get_search_query(stdscr):
+    """Overlay a small input box without leaving curses."""
+    rows, cols = stdscr.getmaxyx()
+    bw, bh = 58, 5
+    by = rows // 2 - bh // 2
+    bx = (cols - bw) // 2
+
+    win = curses.newwin(bh, bw, by, bx)
+    win.bkgd(' ', curses.color_pair(C_NORMAL))
+    border_attr = curses.color_pair(C_BORDER) | curses.A_BOLD
+    draw_box(win, 0, 0, bh, bw, border_attr, " Search packages ")
+    safe_add(win, 2, 3, "Query: ", curses.color_pair(C_HILITE) | curses.A_BOLD)
+    win.refresh()
+
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        raw = win.getstr(2, 10, 40)
+    except KeyboardInterrupt:
+        raw = b""
+    curses.noecho()
+    curses.curs_set(0)
+
+    del win
+    stdscr.touchwin()
+    stdscr.refresh()
+
+    query = raw.decode("utf-8", errors="replace").strip()
+    return query if query else None
+
+# ─── Package search ───────────────────────────────────────────────────────────
+
+def search_packages(query):
+    """
+    Run yay -Ss <query> and parse into tab-delimited lines:
+      name \\t version \\t [repo] \\t description
+    """
+    try:
+        result = subprocess.run(
+            ["yay", "-Ss", query],
+            capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        return []
+
+    lines = result.stdout.split("\n")
+    packages = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Skip yay informational lines
+        if line.startswith(" ->") or line.startswith("->") or not line.strip():
+            i += 1
+            continue
+        # Match: repo/pkgname version [flags...]
+        m = re.match(r"^([a-zA-Z0-9_.+\-]+)/(\S+)\s+(\S+)", line)
+        if m:
+            repo, name, version = m.group(1), m.group(2), m.group(3)
+            desc = ""
+            if i + 1 < len(lines) and lines[i + 1].startswith("    "):
+                desc = lines[i + 1].strip()
+                i += 1
+            packages.append(f"{name}\t{version}\t[{repo}]\t{desc}")
+        i += 1
+    return packages
+
+# ─── fzf launcher ────────────────────────────────────────────────────────────
+
+def run_fzf(items, prompt="Select: ", preview_cmd=None, header=None):
+    """
+    Launch fzf with provided items (list of strings).
+    Must be called AFTER curses.endwin().
+    Returns the selected line or None on cancel.
+    """
+    fzf_args = [
+        "fzf",
+        "--prompt", prompt,
+        "--layout=reverse",
+        "--border",
+        "--border-label", " pkgtui ",
+        "--color", FZF_COLORS,
+        "--ansi",
+        "--height=80%",
+        "--bind", "ctrl-c:abort",
+    ]
+    if header:
+        fzf_args += ["--header", header]
+    if preview_cmd:
+        fzf_args += ["--preview", preview_cmd, "--preview-window", "right:50%:wrap"]
+
+    input_data = "\n".join(items) + "\n"
+    proc = subprocess.run(fzf_args, input=input_data, capture_output=True, text=True)
+
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    return None
+
+# ─── Operations ──────────────────────────────────────────────────────────────
+
+def _print_header(title):
+    width = 62
+    print()
+    print("╔" + "═" * (width - 2) + "╗")
+    print("║" + f"  {title}".ljust(width - 2) + "║")
+    print("╚" + "═" * (width - 2) + "╝")
+    print()
+
+
+def _print_footer(ok):
+    width = 62
+    status = "✓  COMPLETED" if ok else "✗  COMPLETED WITH ERRORS"
+    attr = "\033[32m" if ok else "\033[31m"
+    reset = "\033[0m"
+    print()
+    print("╔" + "═" * (width - 2) + "╗")
+    print("║" + f"  {attr}{status}{reset}".ljust(width - 2 + len(attr) + len(reset)) + "║")
+    print("╚" + "═" * (width - 2) + "╝")
+
+
+def do_update(stdscr):
+    curses.endwin()
+    _print_header("pkgtui  —  System Update")
+
+    print("\033[36m[1/2]\033[0m  sudo pacman -Syu\n")
+    r1 = subprocess.run(["sudo", "pacman", "-Syu"])
+
+    print(f"\n\033[36m[2/2]\033[0m  yay -Syu\n")
+    r2 = subprocess.run(["yay", "-Syu"])
+
+    _print_footer(r1.returncode == 0 and r2.returncode == 0)
+    input("\n  Press Enter to return to menu...")
+    restore_curses(stdscr)
+
+
+def do_search_install(stdscr):
+    query = get_search_query(stdscr)
+    if not query:
+        return
+
+    curses.endwin()
+    print(f"\n  Searching for \033[33m{query}\033[0m …")
+    packages = search_packages(query)
+
+    if not packages:
+        print(f"\n  \033[31mNo packages found matching '{query}'\033[0m")
+        input("  Press Enter to return...")
+        restore_curses(stdscr)
+        return
+
+    # For fzf display use only name + [repo] + description (fields 1,3,4)
+    selected = run_fzf(
+        packages,
+        prompt=f"  Install ({query}): ",
+        preview_cmd="yay -Si {1} 2>/dev/null || pacman -Si {1} 2>/dev/null",
+        header=f"  {len(packages)} packages found  •  Tab/Shift-Tab: preview  •  Enter: install  •  Esc: cancel",
+    )
+
+    if selected:
+        pkg_name = selected.split("\t")[0]
+        _print_header(f"pkgtui  —  Installing: {pkg_name}")
+        subprocess.run(["yay", "-S", pkg_name])
+        input("\n  Press Enter to return to menu...")
+
+    restore_curses(stdscr)
+
+
+def do_remove(stdscr):
+    curses.endwin()
+    print("\n  Loading installed packages …")
+
+    result = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True)
+    packages = [p for p in result.stdout.strip().split("\n") if p]
+
+    if not packages:
+        print("\n  \033[31mNo installed packages found.\033[0m")
+        input("  Press Enter to return...")
+        restore_curses(stdscr)
+        return
+
+    selected = run_fzf(
+        packages,
+        prompt="  Remove: ",
+        preview_cmd="pacman -Qi {} 2>/dev/null",
+        header=f"  {len(packages)} packages installed  •  Enter: remove  •  Esc: cancel",
+    )
+
+    if selected:
+        pkg_name = selected.strip()
+        _print_header(f"pkgtui  —  Removing: {pkg_name}")
+        subprocess.run(["sudo", "pacman", "-Rs", pkg_name])
+        input("\n  Press Enter to return to menu...")
+
+    restore_curses(stdscr)
+
+# ─── Main loop ────────────────────────────────────────────────────────────────
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(-1)
+    init_colors()
+
+    sel = 0
+    while True:
+        draw_menu(stdscr, sel)
+        key = stdscr.getch()
+
+        if key == curses.KEY_UP:
+            sel = (sel - 1) % len(MENU_ITEMS)
+        elif key == curses.KEY_DOWN:
+            sel = (sel + 1) % len(MENU_ITEMS)
+        elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+            if   sel == 0: do_update(stdscr)
+            elif sel == 1: do_search_install(stdscr)
+            elif sel == 2: do_remove(stdscr)
+            elif sel == 3: break
+        elif key in (ord("q"), ord("Q"), 27):
+            break
+        elif key == ord("1"): do_update(stdscr)
+        elif key == ord("2"): do_search_install(stdscr)
+        elif key == ord("3"): do_remove(stdscr)
+        elif key == ord("4"): break
+        elif key == curses.KEY_RESIZE:
+            stdscr.clear()
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+
+def check_deps():
+    missing = [t for t in ("fzf", "yay", "pacman") if not shutil.which(t)]
+    return missing
+
+
+if __name__ == "__main__":
+    missing = check_deps()
+    if missing:
+        print(f"\033[31m[pkgtui] Missing required tools: {', '.join(missing)}\033[0m",
+              file=sys.stderr)
+        sys.exit(1)
+
+    locale.setlocale(locale.LC_ALL, "")
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+
+    print("\n  Goodbye!\n")
