@@ -527,8 +527,9 @@ def search_packages(query):
 
 # ─── fzf launcher ────────────────────────────────────────────────────────────
 
-def run_fzf(items, prompt="Select: ", preview_cmd=None, header=None):
-    """Run fzf (must be called after curses.endwin()). Returns selected line."""
+def run_fzf(items, prompt="Select: ", preview_cmd=None, header=None, multi=False):
+    """Run fzf (must be called after curses.endwin()).
+    Returns str|None when multi=False, list[str] when multi=True."""
     args = [
         "fzf",
         "--prompt", prompt,
@@ -538,6 +539,8 @@ def run_fzf(items, prompt="Select: ", preview_cmd=None, header=None):
         "--ansi", "--height=80%",
         "--bind", "ctrl-c:abort",
     ]
+    if multi:
+        args += ["--multi", "--bind", "tab:toggle+down,shift-tab:toggle+up"]
     if header:
         args += ["--header", header]
     if preview_cmd:
@@ -545,7 +548,12 @@ def run_fzf(items, prompt="Select: ", preview_cmd=None, header=None):
 
     proc = subprocess.run(args, input="\n".join(items) + "\n",
                           capture_output=True, text=True)
-    return proc.stdout.strip() if proc.returncode == 0 else None
+    if proc.returncode != 0:
+        return [] if multi else None
+    raw = proc.stdout.strip()
+    if multi:
+        return [line for line in raw.splitlines() if line]
+    return raw if raw else None
 
 
 def _restore(stdscr):
@@ -585,15 +593,16 @@ def do_search_install(stdscr):
         packages,
         prompt=f"  Install ({query}): ",
         preview_cmd="yay -Si {1} 2>/dev/null || pacman -Si {1} 2>/dev/null",
-        header=(f"  {len(packages)} packages  •  Tab: preview  "
+        header=(f"  {len(packages)} packages  •  [Tab] Multi-select  "
                 "•  Enter: install  •  Esc: cancel"),
+        multi=True,
     )
 
     _restore(stdscr)
 
     if selected:
-        pkg_name = selected.split("\t")[0]
-        run_in_log_window(stdscr, 1, [["yay", "-S", pkg_name]])
+        pkg_names = [s.split("\t")[0] for s in selected]
+        run_in_log_window(stdscr, 1, [["yay", "-S"] + pkg_names])
 
 
 def do_remove(stdscr):
@@ -613,13 +622,14 @@ def do_remove(stdscr):
         prompt="  Remove: ",
         preview_cmd="pacman -Qi {} 2>/dev/null",
         header=(f"  {len(packages)} packages installed  "
-                "•  Enter: remove  •  Esc: cancel"),
+                "•  [Tab] Multi-select  •  Enter: remove  •  Esc: cancel"),
+        multi=True,
     )
 
     _restore(stdscr)
 
     if selected:
-        run_in_log_window(stdscr, 2, [["sudo", "pacman", "-Rs", selected.strip()]])
+        run_in_log_window(stdscr, 2, [["sudo", "pacman", "-Rs"] + selected])
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
