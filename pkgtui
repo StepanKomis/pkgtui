@@ -12,6 +12,7 @@ import select
 import shutil
 import subprocess
 import sys
+import time
 
 VERSION = "1.0.1"
 MIN_ROWS, MIN_COLS = 24, 80
@@ -24,7 +25,9 @@ C_NORMAL = 3
 C_OK     = 4
 C_ERROR  = 5
 C_DIM    = 6
-C_SEL    = 7
+C_SEL     = 7
+C_ACTIVE  = 8   # bright white on blue — active op in nav bar
+C_DL_DONE = 9   # green on default     — completed download row
 
 MENU_ITEMS = [
     ("[1] System Update",    "Upgrade all packages via pacman + yay (AUR)"),
@@ -68,7 +71,9 @@ def init_colors():
     curses.init_pair(C_OK,     curses.COLOR_GREEN,  -1)
     curses.init_pair(C_ERROR,  curses.COLOR_RED,    -1)
     curses.init_pair(C_DIM,    curses.COLOR_BLUE,   -1)
-    curses.init_pair(C_SEL,    curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_SEL,     curses.COLOR_BLACK,  curses.COLOR_CYAN)
+    curses.init_pair(C_ACTIVE,  curses.COLOR_WHITE,  curses.COLOR_BLUE)
+    curses.init_pair(C_DL_DONE, curses.COLOR_GREEN,  -1)
 
 
 def safe_add(win, y, x, text, attr=0):
@@ -188,6 +193,111 @@ class LogWindow:
             pass
 
 
+# ─── Download progress tracker ───────────────────────────────────────────────
+
+# Matches pacman's download progress lines after ANSI stripping, e.g.:
+#   some-pkg-1.2-x86_64.pkg.tar.zst   5.2 MiB   2.1 MiB/s   00:02  [########  ]  80%
+_DL_RE = re.compile(
+    r"(\S+\.(?:pkg\.tar\.(?:zst|xz|gz|bz2)|sig))"
+    r"\s{2,}([\d.]+\s*\w+(?:/s)?)"   # size
+    r"\s{2,}([\d.]+\s*[\w/]+)"        # speed
+    r"\s{2,}(\d+:\d+)"                # ETA
+    r"\s+\[([^\]]+)\]"                # bar chars
+    r"\s+(\d+)%"                       # percent
+)
+_PKG_NAME_RE = re.compile(
+    r"^(.+?)-[^-]+-[^-]+-(?:x86_64|i686|any|aarch64)\.pkg\.tar\.\w+$"
+)
+
+
+class DownloadTracker:
+    """Parses pacman download progress lines and renders a live table."""
+
+    MAX_ROWS = 6
+    DIVIDER  = "┄"
+
+    def __init__(self):
+        self._pkgs  = {}   # filename → {size, speed, eta, percent, done}
+        self._order = []   # stable insertion order
+
+    def feed(self, text):
+        for line in re.split(r"[\r\n]", text):
+            m = _DL_RE.search(line.strip())
+            if not m:
+                continue
+            fname, size, speed, eta, bar, pct = (
+                m.group(1), m.group(2), m.group(3),
+                m.group(4), m.group(5), int(m.group(6)),
+            )
+            if fname not in self._pkgs:
+                self._order.append(fname)
+            self._pkgs[fname] = {
+                "size":  size.strip(),
+                "speed": speed.strip(),
+                "eta":   eta,
+                "pct":   pct,
+                "done":  pct >= 100,
+            }
+
+    def has_entries(self):
+        return bool(self._pkgs)
+
+    def table_height(self):
+        n = min(len(self._pkgs), self.MAX_ROWS)
+        if n == 0:
+            return 0
+        return 2 + n + max(0, n - 1)   # header + divider + rows + inter-dividers
+
+    def _display_name(self, fname):
+        m = _PKG_NAME_RE.match(fname)
+        return m.group(1) if m else fname
+
+    def render_table(self, win, y, x, w):
+        if not self._pkgs:
+            return
+        ba   = curses.color_pair(C_BORDER) | curses.A_BOLD
+        hi   = curses.color_pair(C_HILITE) | curses.A_BOLD
+        dim  = curses.color_pair(C_DIM)
+        ok   = curses.color_pair(C_DL_DONE) | curses.A_BOLD
+        norm = curses.color_pair(C_NORMAL)
+
+        # Fixed column widths
+        SZ_W, SPD_W, ETA_W, BAR_W, PCT_W = 9, 10, 5, 14, 4
+        fixed   = SZ_W + SPD_W + ETA_W + BAR_W + PCT_W + 5
+        name_w  = max(8, w - fixed - 2)
+
+        # Header
+        hdr = (f"{'Package':<{name_w}} "
+               f"{'Size':>{SZ_W}} "
+               f"{'Speed':>{SPD_W}} "
+               f"{'ETA':>{ETA_W}} "
+               f"{'':^{BAR_W}} "
+               f"{'%':>{PCT_W}}")
+        safe_add(win, y, x, hdr[:w], hi)
+        y += 1
+        safe_add(win, y, x, (self.DIVIDER * w)[:w], dim)
+        y += 1
+
+        visible = self._order[-self.MAX_ROWS:]
+        for idx, fname in enumerate(visible):
+            e    = self._pkgs[fname]
+            pct  = e["pct"]
+            filled   = int(BAR_W * pct / 100)
+            bar_str  = "█" * filled + "░" * (BAR_W - filled)
+            name     = self._display_name(fname)
+            row = (f"{name:<{name_w}.{name_w}} "
+                   f"{e['size']:>{SZ_W}} "
+                   f"{e['speed']:>{SPD_W}} "
+                   f"{e['eta']:>{ETA_W}} "
+                   f"{bar_str} "
+                   f"{pct:>{PCT_W}}%")
+            safe_add(win, y, x, row[:w], ok if e["done"] else norm)
+            y += 1
+            if idx < len(visible) - 1:
+                safe_add(win, y, x, (self.DIVIDER * w)[:w], dim)
+                y += 1
+
+
 # ─── Log-view chrome ──────────────────────────────────────────────────────────
 
 #  Layout (rows = terminal height):
@@ -203,18 +313,19 @@ LOG_TOP  = 3   # first row of log content
 LOG_BOT_OFFSET = 2   # rows reserved at bottom (separator + status)
 
 
-def _log_geometry(rows, cols):
-    """Return (log_y, log_x, log_h, log_w)."""
-    log_y = LOG_TOP
-    log_h = rows - LOG_TOP - LOG_BOT_OFFSET
+def _log_geometry(rows, cols, table_h=0):
+    """Return (log_y, log_x, log_h, log_w). table_h reserves rows above the log."""
+    log_y = LOG_TOP + table_h
+    log_h = rows - LOG_TOP - LOG_BOT_OFFSET - table_h
     log_x = 1
     log_w = cols - 2
     return log_y, log_x, max(log_h, 1), max(log_w, 1)
 
 
-def draw_log_chrome(stdscr, active_idx, status="", is_done=False):
+def draw_log_chrome(stdscr, active_idx, status="", is_done=False,
+                    tracker=None, show_log=True, elapsed=0.0):
     rows, cols = stdscr.getmaxyx()
-    ba = curses.color_pair(C_BORDER) | curses.A_BOLD  # border attr
+    ba = curses.color_pair(C_BORDER) | curses.A_BOLD
 
     # ── top border with title ──
     title = f" pkgtui v{VERSION} "
@@ -224,16 +335,15 @@ def draw_log_chrome(stdscr, active_idx, status="", is_done=False):
     safe_add(stdscr, 0, 0, "╔" + "═" * pad_l + title + "═" * pad_r + "╗", ba)
 
     # ── nav bar ──
-    safe_add(stdscr, 1, 0,       "║", ba)
-    safe_add(stdscr, 1, cols - 1, "║", ba)
-    # Fill with spaces first
+    safe_add(stdscr, 1, 0,        "║", ba)
+    safe_add(stdscr, 1, cols - 1,  "║", ba)
     safe_add(stdscr, 1, 1, " " * (cols - 2), curses.color_pair(C_DIM))
     nav_x = 2
     for i, (label, _) in enumerate(MENU_ITEMS):
         seg = ("● " if i == active_idx else "  ") + label + "   "
         if nav_x + len(seg) >= cols - 1:
             break
-        attr = (curses.color_pair(C_HILITE) | curses.A_BOLD
+        attr = (curses.color_pair(C_ACTIVE) | curses.A_BOLD
                 if i == active_idx else curses.color_pair(C_DIM))
         safe_add(stdscr, 1, nav_x, seg, attr)
         nav_x += len(seg)
@@ -241,18 +351,32 @@ def draw_log_chrome(stdscr, active_idx, status="", is_done=False):
     # ── separator ──
     safe_add(stdscr, 2, 0, "╠" + "═" * (cols - 2) + "╣", ba)
 
+    # ── download table zone (optional) ──
+    table_h = 0
+    if tracker and tracker.has_entries():
+        rows_avail = rows - LOG_TOP - LOG_BOT_OFFSET
+        table_h = min(tracker.table_height(), rows_avail - 2)
+        if table_h > 0:
+            for r in range(LOG_TOP, LOG_TOP + table_h):
+                safe_add(stdscr, r, 0,        "║", ba)
+                safe_add(stdscr, r, cols - 1,  "║", ba)
+            tracker.render_table(stdscr, LOG_TOP, 2, cols - 4)
+            safe_add(stdscr, LOG_TOP + table_h, 0,
+                     "╠" + "═" * (cols - 2) + "╣", ba)
+
     # ── log area side borders ──
-    log_y, _, log_h, _ = _log_geometry(rows, cols)
-    for r in range(log_y, log_y + log_h):
-        safe_add(stdscr, r, 0,       "║", ba)
-        safe_add(stdscr, r, cols - 1, "║", ba)
+    log_y, _, log_h, _ = _log_geometry(rows, cols, table_h)
+    if show_log:
+        for r in range(log_y, log_y + log_h):
+            safe_add(stdscr, r, 0,        "║", ba)
+            safe_add(stdscr, r, cols - 1,  "║", ba)
 
     # ── bottom separator ──
     safe_add(stdscr, rows - 2, 0, "╠" + "═" * (cols - 2) + "╣", ba)
 
     # ── status bar ──
-    safe_add(stdscr, rows - 1, 0,       "║", ba)
-    safe_add(stdscr, rows - 1, cols - 1, "║", ba)
+    safe_add(stdscr, rows - 1, 0,        "║", ba)
+    safe_add(stdscr, rows - 1, cols - 1,  "║", ba)
     safe_add(stdscr, rows - 1, 1, " " * (cols - 2), curses.color_pair(C_DIM))
 
     if is_done:
@@ -260,10 +384,11 @@ def draw_log_chrome(stdscr, active_idx, status="", is_done=False):
         safe_add(stdscr, rows - 1, 1, msg,
                  curses.color_pair(C_OK) | curses.A_BOLD)
     elif status:
-        msg = f"  $ {status}"
+        elapsed_str = f"  {int(elapsed)}s" if elapsed >= 1 else ""
+        msg = f"  $ {status}{elapsed_str}"
         safe_add(stdscr, rows - 1, 1, msg[:cols // 2], curses.color_pair(C_NORMAL))
 
-    hints = "[↑↓/PgUp/Dn] Scroll   [y/n/Enter] Confirm   [q] Back "
+    hints = "[↑↓/PgUp/Dn] Scroll  [L] Toggle log  [q] Back "
     safe_add(stdscr, rows - 1, cols - len(hints) - 1, hints,
              curses.color_pair(C_DIM))
 
@@ -278,24 +403,30 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
     Uses a pty so pacman/yay keep their progress bars and colour.
     Returns True if all commands exited 0.
     """
-    rows, cols = stdscr.getmaxyx()
-    log_y, log_x, log_h, log_w = _log_geometry(rows, cols)
+    rows, cols  = stdscr.getmaxyx()
+    tracker     = DownloadTracker()
+    show_log    = True
+    start_time  = time.monotonic()
+    prev_table_h = 0
 
+    log_y, log_x, log_h, log_w = _log_geometry(rows, cols, 0)
     log = LogWindow(stdscr, log_y, log_x, log_h, log_w)
 
     stdscr.clear()
-    draw_log_chrome(stdscr, active_idx)
+    draw_log_chrome(stdscr, active_idx, tracker=tracker, show_log=show_log)
     log.refresh()
 
     stdscr.nodelay(True)
-    all_ok = True
+    all_ok  = True
+    cmd_str = ""
 
     for cmd in cmd_list:
         cmd_str = " ".join(cmd)
-        draw_log_chrome(stdscr, active_idx, cmd_str)
+        elapsed = time.monotonic() - start_time
+        draw_log_chrome(stdscr, active_idx, cmd_str,
+                        tracker=tracker, show_log=show_log, elapsed=elapsed)
         log.write(f"\n  $ {cmd_str}\n\n")
 
-        # ── open a pty so the child thinks it has a real terminal ──
         master_fd, slave_fd = os.openpty()
         try:
             proc = subprocess.Popen(
@@ -319,7 +450,6 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
         running = True
 
         while running:
-            # Wait up to 50 ms for pty output
             rlist, _, _ = select.select([master_fd], [], [], 0.05)
 
             if rlist:
@@ -327,18 +457,41 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
                     data = os.read(master_fd, 4096)
                     if data:
                         text = strip_ansi(data.decode("utf-8", errors="replace"))
-                        # Ensure password prompts start on their own line
                         text = re.sub(r"(?<!\n)(\[sudo\]|Password:)", r"\n\1", text)
+                        tracker.feed(text)
                         log.write(text)
+                        # Reposition log window if table grew
+                        new_th = tracker.table_height()
+                        if new_th != prev_table_h:
+                            log.y      = _log_geometry(rows, cols, new_th)[0]
+                            log.height = _log_geometry(rows, cols, new_th)[2]
+                            prev_table_h = new_th
+                            stdscr.clear()
+                        elapsed = time.monotonic() - start_time
+                        draw_log_chrome(stdscr, active_idx, cmd_str,
+                                        tracker=tracker, show_log=show_log,
+                                        elapsed=elapsed)
+                        if show_log:
+                            log.refresh()
                 except OSError:
                     running = False
 
-            # ── handle keypresses ──
             key = stdscr.getch()
-            if key in (ord("q"), 27):                  # q / Esc → interrupt
+            if key in (ord("q"), 27):
                 proc.terminate()
                 log.write("\n  [Interrupted by user]\n")
                 running = False
+            elif key in (ord("l"), ord("L")):
+                show_log = not show_log
+                th = tracker.table_height()
+                log.y      = _log_geometry(rows, cols, th)[0]
+                log.height = _log_geometry(rows, cols, th)[2]
+                stdscr.clear()
+                elapsed = time.monotonic() - start_time
+                draw_log_chrome(stdscr, active_idx, cmd_str,
+                                tracker=tracker, show_log=show_log, elapsed=elapsed)
+                if show_log:
+                    log.refresh()
             elif key == curses.KEY_UP:
                 log.scroll_by(-1)
             elif key == curses.KEY_DOWN:
@@ -347,20 +500,28 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
                 log.scroll_by(-(log_h // 2))
             elif key == curses.KEY_NPAGE:
                 log.scroll_by(log_h // 2)
-            elif key in (curses.KEY_ENTER, 10, 13):    # Enter → forward \n
+            elif key == curses.KEY_RESIZE:
+                rows, cols = stdscr.getmaxyx()
+                th = tracker.table_height()
+                log.y = _log_geometry(rows, cols, th)[0]
+                log.height = _log_geometry(rows, cols, th)[2]
+                stdscr.clear()
+                draw_log_chrome(stdscr, active_idx, cmd_str,
+                                tracker=tracker, show_log=show_log, elapsed=elapsed)
+                if show_log:
+                    log.refresh()
+            elif key in (curses.KEY_ENTER, 10, 13):
                 try:
                     os.write(master_fd, b"\n")
                 except OSError:
                     pass
-            elif key != -1 and 32 <= key <= 126:       # printable → forward
+            elif key != -1 and 32 <= key <= 126:
                 try:
                     os.write(master_fd, chr(key).encode())
                 except OSError:
                     pass
 
-            # ── check if process finished ──
             if proc.poll() is not None:
-                # drain remaining pty output
                 try:
                     while True:
                         r, _, _ = select.select([master_fd], [], [], 0.1)
@@ -369,7 +530,9 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
                         chunk = os.read(master_fd, 4096)
                         if not chunk:
                             break
-                        log.write(strip_ansi(chunk.decode("utf-8", errors="replace")))
+                        text = strip_ansi(chunk.decode("utf-8", errors="replace"))
+                        tracker.feed(text)
+                        log.write(text)
                 except OSError:
                     pass
                 running = False
@@ -386,8 +549,7 @@ def run_in_log_window(stdscr, active_idx, cmd_list):
         else:
             log.write("\n  [✓ Done]\n")
 
-    # ── wait for any key before returning ──
-    draw_log_chrome(stdscr, active_idx, is_done=True)
+    draw_log_chrome(stdscr, active_idx, is_done=True, tracker=tracker)
     stdscr.nodelay(False)
     stdscr.getch()
 
