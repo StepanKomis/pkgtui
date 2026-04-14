@@ -45,8 +45,19 @@ Handles system updates and package installs/removals via `pacman` and `yay` (AUR
 
 ## Install
 
+### From AUR (recommended)
+
 ```bash
-git clone <this-repo> ~/pkgtui   # or however you got here
+yay -S pkgtui
+```
+
+Or with any other AUR helper (`paru`, `trizen`, etc.). The package page is at
+https://aur.archlinux.org/packages/pkgtui
+
+### From source
+
+```bash
+git clone https://github.com/StepanKomis/pkgtui ~/pkgtui
 cd ~/pkgtui
 bash install.sh
 ```
@@ -70,6 +81,12 @@ pkgtui
 
 ## Uninstall
 
+**If installed from AUR:**
+```bash
+yay -R pkgtui
+```
+
+**If installed from source:**
 ```bash
 bash ~/pkgtui/uninstall.sh
 ```
@@ -124,4 +141,4 @@ Exit pkgtui. Also reachable with `q` or `Esc`.
 
 ## License
 
-Do whatever you want with it. It's vibecoded anyway.
+[GPL-3.0-only](LICENSE)
